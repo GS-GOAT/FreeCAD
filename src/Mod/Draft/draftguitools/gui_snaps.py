@@ -30,11 +30,12 @@
 
 ## \addtogroup draftguitools
 # @{
-from PySide import QtGui
+from PySide import QtGui, QtCore
 from PySide.QtCore import QT_TRANSLATE_NOOP
-
+import FreeCAD
 import FreeCADGui as Gui
 import draftguitools.gui_base as gui_base
+from draftguitools.gui_trackers import Tracker, SnapTracker  # Import SnapTracker from gui_trackers
 
 from draftutils.messages import _log
 from draftutils.translate import translate
@@ -56,22 +57,55 @@ class Draft_Snap_Base():
         """Return true if the given snap is active in Snapper."""
         return hasattr(Gui, "Snapper") and self.__class__.__name__[11:] in Gui.Snapper.active_snaps
 
+    def toggleSnapMode(self, mode, status):
+        """
+        Toggle snap modes efficiently without redundant updates.
+        """
+        if not hasattr(Gui, "Snapper"):
+            FreeCAD.Console.PrintError("Error: Gui.Snapper is missing. Cannot toggle snap mode.\n")
+            return
+        
+        # Ensure snap_modes exists before checking state
+        if not hasattr(Gui.Snapper, "snap_modes") or Gui.Snapper.snap_modes is None:
+            FreeCAD.Console.PrintError("Error: Gui.Snapper.snap_modes is missing. Cannot check snap state.\n")
+            return 
+
+        Gui.Snapper.toggle_snap(mode, bool(status))
+
 
 class Draft_Snap_Lock(Draft_Snap_Base):
     """GuiCommand for the Draft_Snap_Lock tool."""
 
+    def __init__(self):
+        self.tracker = SnapTracker()  # Use the existing SnapTracker
+
     def GetResources(self):
-        return {"Pixmap":    "Draft_Snap_Lock",
-                "Accel":     "Shift+S",
-                "MenuText":  QT_TRANSLATE_NOOP("Draft_Snap_Lock", "Snap lock"),
-                "ToolTip":   QT_TRANSLATE_NOOP("Draft_Snap_Lock", "Enables or disables snapping globally."),
-                "CmdType":   "NoTransaction",
-                "Checkable": self.isChecked()}
+        return {
+            "Pixmap": "Draft_Snap_Lock",
+            "Accel": "Shift+S",
+            "MenuText": QT_TRANSLATE_NOOP("Draft_Snap_Lock", "Snap lock"),
+            "ToolTip": QT_TRANSLATE_NOOP("Draft_Snap_Lock", "Enables or disables snapping globally."),
+            "CmdType": "NoTransaction",
+            "Checkable": self.isChecked()
+        }
 
-    def IsActive(self): return True
+    def Activated(self, status=0):
+        super().Activated(status)
+        if status:
+            self.toggleSnapMode("Lock", True)
+            self.tracker.start_tracking()  # Start tracking when activated
+        else:
+            self.toggleSnapMode("Lock", False) 
+            self.tracker.stop_tracking()  # Stop tracking when deactivated
+
+    def IsActive(self):
+        return self.tracker.is_active()  # Check if the tracker is active
 
 
-Gui.addCommand("Draft_Snap_Lock", Draft_Snap_Lock())
+try:
+    Gui.addCommand("Draft_Snap_Lock", Draft_Snap_Lock())
+except AttributeError:
+    FreeCAD.Console.PrintError("Warning: Draft_Snap_Lock command missing.\n")
 
 
 class Draft_Snap_Midpoint(Draft_Snap_Base):
@@ -290,3 +324,86 @@ class ShowSnapBar(Draft_Snap_Base):
 Gui.addCommand('Draft_ShowSnapBar', ShowSnapBar())
 
 ## @}
+
+def keyPressEvent(self, event):
+    key = event.key()
+
+    # Ensure tracker is initialized before using it
+    if not hasattr(self, "tracker") or self.tracker is None:
+        FreeCAD.Console.PrintError("Error: Tracker is missing. Cannot process input.\n")
+        event.accept()
+        return
+
+    if key == QtCore.Qt.Key_Q:
+        # Set the hold point using the current snap point
+        if self.currentSnapPoint is not None:
+            self.tracker.setHoldPoint(self.currentSnapPoint)
+            FreeCAD.Console.PrintMessage(f"Hold point set to: {self.currentSnapPoint}\n")
+        event.accept()
+        return
+
+    elif key == QtCore.Qt.Key_Escape:
+        # Clear the hold point
+        self.tracker.clearHoldPoint()
+        FreeCAD.Console.PrintMessage("Hold point cleared.\n")
+        event.accept()
+        return
+
+    elif QtCore.Qt.Key_0 <= key <= QtCore.Qt.Key_9:
+        if not self.tracker.holdPoint:
+            event.accept()  
+            return
+
+        digit = event.text()
+        if not digit.isdigit():
+            FreeCAD.Console.PrintError(f"Invalid numeric input ignored: {digit}\n")
+            event.accept()
+            return
+
+        # Directions only calculated for first digit and the rest only updates number
+        if self.tracker.inputDistance is None:
+            self.tracker.processNumericInput(digit)
+
+            if self.tracker.holdPoint and self.currentSnapPoint:
+                direction = self.currentSnapPoint - self.tracker.holdPoint
+                wp = self.tracker._get_wp()
+                direction_local = wp.get_local_rotation().multVec(direction)
+                self.tracker.locked_dir_vector = self.tracker.get_orthogonal_direction(direction_local)
+        else:
+            self.tracker.processNumericInput(digit)  #Only updates number, not direction
+
+        event.accept()
+        return
+    
+    elif key in (QtCore.Qt.Key_Backspace, QtCore.Qt.Key_Delete):
+        if self.tracker.inputDistance:
+            self.tracker.inputDistance = self.tracker.inputDistance[:-1] # Remove last char
+            self.tracker.updateTracking() # Update tracker after correction
+            FreeCAD.Console.PrintMessage("Numeric input backspaced. Current input: {}\n".format(self.tracker.inputDistance)) # Optional feedback
+        event.accept()
+        return
+
+    elif key in (QtCore.Qt.Key_Period, QtCore.Qt.Key_Comma):
+        # Accept decimal separator (convert comma to dot if necessary)
+        self.tracker.processNumericInput(".")
+        event.accept()
+        return
+
+    elif key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+        # Ensure tracker has valid input before committing
+        if not self.tracker.inputDistance or self.tracker.inputDistance.strip() == "":
+            FreeCAD.Console.PrintError("No valid numeric input. Press Escape to reset or enter a valid number.\n")
+            event.accept()
+            return
+
+        # Proceed with committing valid input
+        target = self.tracker.commitInput()
+        if target is not None:
+            FreeCAD.Console.PrintMessage(f"Geometry created at: {target}\n")
+
+        event.accept()
+        return
+
+    # For any other key, invoke the default handler
+    super().keyPressEvent(event)
+

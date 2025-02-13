@@ -58,7 +58,7 @@ class Tracker:
     """A generic Draft Tracker, to be used by other specific trackers."""
 
     def __init__(self, dotted=False, scolor=None, swidth=None,
-                 children=[], ontop=False, name=None):
+                 children=None, ontop=False, name=None, create_ortho_line=True):
         global Part, DraftGeomUtils
         import Part
         import DraftGeomUtils
@@ -82,13 +82,24 @@ class Tracker:
         self.setColor(scolor)
         self.Visible = False
         ToDo.delay(self._insertSwitch, self.switch)
+        self.currentPoint = None
+        self.holdPoint = None         # The snap point to use as origin for measurement.
+        self.inputDistance = None     # The numeric offset entered by the user.
+        self.input_active = False     # Flag indicating that numeric input mode is active.
+        self.ortho_line_tracker = None 
+        if create_ortho_line:
+            self.ortho_line_tracker = lineTracker(dotted=True, scolor=(1, 1, 0))  # Dashed yellow line
+            if self.ortho_line_tracker:      
+                self.ortho_line_tracker.on()
 
     def finalize(self):
         """Finish the command by removing the switch.
         Also called by ghostTracker.remove.
+        Clean up both the main tracker and the orthogonal line tracker.
         """
         ToDo.delay(self._removeSwitch, self.switch)
         self.switch = None
+        self.ortho_line_tracker.finalize()
 
     def get_scene_graph(self):
         """Returns the current scenegraph or None if this is not a 3D view
@@ -173,6 +184,116 @@ class Tracker:
 
     def _get_wp(self):
         return FreeCAD.DraftWorkingPlane
+
+    def setHoldPoint(self, point):
+        """
+        Save the given point as the hold point. Future tracking will use this as the base 
+        for distance measurements.
+        """
+        self.holdPoint = point
+        # Reset any previous numeric input
+        self.inputDistance = ""
+        self.input_active = True
+        FreeCAD.Console.PrintMessage("Hold point set: {}\n".format(point))
+
+    def clearHoldPoint(self):   
+        """
+        Clear the hold point and reset tracking.
+        """
+        self.holdPoint = None
+        self.inputDistance = ""
+        self.input_active = False
+        self.locked_dir_vector = None
+        if hasattr(self, "ortho_line_tracker") and self.ortho_line_tracker:
+            self.ortho_line_tracker.off()  # Hide the orthogonal line
+
+        FreeCAD.Console.PrintMessage("Hold point cleared.\n")
+
+    def get_orthogonal_direction(self, vector):
+        """
+        Determines the closest orthogonal direction relative to the working plane.
+        Returns a unit vector along the dominant axis (u, v, or normal).
+        """
+        wp = self._get_wp()
+        vec_local = wp.get_local_rotation().multVec(vector)
+        abs_proj = FreeCAD.Vector(abs(vec_local.x), abs(vec_local.y), abs(vec_local.z))
+        max_val = max(abs_proj.x, abs_proj.y, abs_proj.z)
+
+        if max_val == abs_proj.x:
+            return wp.u.normalize() * (1 if vec_local.x > 0 else -1)
+        elif max_val == abs_proj.y:
+            return wp.v.normalize() * (1 if vec_local.y > 0 else -1)
+        else:
+            return wp.axis.normalize() * (1 if vec_local.z > 0 else -1)
+
+    def processNumericInput(self, key_text):
+        """Process numeric input but delay tracking updates until input is complete."""
+        if self.inputDistance is None:
+            self.inputDistance = ""
+
+        self.inputDistance += key_text  # Append number to input string
+ 
+        FreeCAD.Console.PrintMessage("DEBUG: Updating snap tracking after numeric input.\n")
+
+
+    def commitInput(self):
+        """Commit numeric input and update tracking only once."""
+        if not self.inputDistance or not self.inputDistance.strip():
+            FreeCAD.Console.PrintError("No valid numeric input. Press Escape to reset or enter a valid number.\n")
+            return None
+
+        try:
+            distance = float(self.inputDistance)
+        except (ValueError, TypeError):
+            FreeCAD.Console.PrintError(f"Invalid numeric input: {self.inputDistance}\n")
+            return None
+
+        if self.holdPoint is not None and self.locked_dir_vector is not None:
+            target_point = self.holdPoint + self.locked_dir_vector * distance
+            FreeCAD.Console.PrintMessage(f"Committed target point: {target_point}\n")
+
+            # Update tracking once input is fully committed
+            self.updateTracking()
+            self.clearHoldPoint()
+            return target_point
+
+        return None
+
+    def updateTracking(self):
+        """Update the tracking point with locked direction."""
+        if self.holdPoint is not None and self.input_active and self.inputDistance is not None:
+            try:
+                distance = float(self.inputDistance) if self.inputDistance else 0.0
+            except ValueError:
+                distance = 0.0
+
+            if self.locked_dir_vector is not None:
+                # Use locked direction
+                new_point = self.holdPoint + self.locked_dir_vector * distance
+                # Update orthogonal line display
+                self.ortho_line_tracker.p1(self.holdPoint)
+                self.ortho_line_tracker.p2(new_point)
+                self.ortho_line_tracker.on()
+            else:
+                # Checking if `currentPoint` exists before computing direction
+                if hasattr(self, 'currentPoint') and self.currentPoint is not None:
+                    direction = self.currentPoint - self.holdPoint
+                    if direction.Length != 0:
+                        direction = direction.normalize()
+                    else:
+                        direction = FreeCAD.Vector(1, 0, 0)  # Default to X-axis
+                    new_point = self.holdPoint + direction * distance
+                else:
+                    new_point = self.holdPoint  # No valid currentPoint, fallback
+
+            self.displayPoint(new_point)
+
+    def displayPoint(self, point):
+        """
+        Updates the visual preview of the tracked point in the Draft Workbench.
+        Log the computed point to the console.
+        """
+        FreeCAD.Console.PrintMessage("Displaying point at: {}\n".format(point))
 
 
 class snapTracker(Tracker):
